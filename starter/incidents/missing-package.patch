@@ -1,0 +1,11 @@
+diff --git a/requirements.txt b/requirements.txt
+index c70821f..b7f282d 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -3,6 +3,5 @@ uvicorn>=0.30
+ openai>=1.60
+ httpx>=0.27
+ tzdata>=2024.1
+-python-multipart>=0.0.9
+ pytesseract>=0.3.10
+ pillow>=10.4
