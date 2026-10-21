@@ -10,7 +10,7 @@
 | Cloud Run 첫 배포 ② | Google Cloud 프로젝트, gcloud 로그인과 프로젝트·리전 설정, API 4개 사용 설정, 템플릿으로 만든 내 저장소 | 아래 A | 20~40분 |
 | | `friend-agent` 서비스가 비밀값 `llm-api-key` 를 참조해 배포되어 있음 | 아래 B | 15분 |
 | 자동 배포 | (위와 같음) | | |
-| 자동 검사와 환경 분리 | 배포용·실행용 서비스 계정과 Workload Identity 설정, 저장소 변수 4개 | `docs/wif-setup.md` 0~4단계와 7단계 | 30분 |
+| 자동 검사와 환경 분리 | 배포용·실행용·빌드용 서비스 계정과 Workload Identity 설정, 저장소 변수 5개 | `docs/wif-setup.md` 0~4단계와 7단계 | 30분 |
 | | `.github/workflows/deploy.yml` 이 main 머지 때 배포함 | 아래 C | 10분 |
 | Dockerfile | `.github/workflows/ci.yml`, staging·production 으로 나눠 배포하는 `deploy.yml` | 아래 D | 15분 |
 | | GitHub 환경 `staging`·`production`(변수 SERVICE, ENV. production 은 배포 승인자 지정), `staging` 브랜치 | 아래 D | 15분 |
@@ -106,7 +106,33 @@ PR로 올려 staging, production 에 배포한다.
 `.github/workflows/deploy.yml` 의 배포 단계 `flags` 줄을 아래처럼 바꾼다. 앱이 `/health` 에 정상 응답해야 요청을 받기 시작한다.
 
 ```text
-flags: --service-account=${{ vars.RUNTIME_SA }} --startup-probe=httpGet.path=/health,periodSeconds=5,failureThreshold=12,timeoutSeconds=2
+flags: --service-account=${{ vars.RUNTIME_SA }} --build-service-account=projects/${{ vars.GCP_PROJECT_ID }}/serviceAccounts/${{ vars.BUILD_SA }} --startup-probe=httpGet.path=/health,periodSeconds=5,failureThreshold=12,timeoutSeconds=2
 ```
 
 PR로 올려 배포한 뒤, 콘솔의 리비전 상세에서 시작 확인이 `/health` 로 설정되었는지 본다.
+
+## 템플릿이 바뀌었을 때
+
+템플릿으로 만든 저장소는 만든 순간의 파일만 복사한 새 저장소라서, 템플릿이 바뀌어도 내 저장소에는 반영되지 않습니다. 강사가 템플릿의 특정 파일을 고쳤다고 안내하면, 그 파일만 템플릿에서 가져와 덮어씁니다. 아래 명령의 파일 이름은 안내받은 파일로 바꿉니다.
+
+```text
+# 내 저장소 폴더에서. remote 추가는 처음 한 번만 한다
+git remote add template https://github.com/88chacha/friend-agent-template.git
+
+# 템플릿의 최신 내용을 받고, 안내받은 파일만 가져온다
+git fetch template
+git checkout template/main -- <파일 경로> <파일 경로>
+
+git status          # 가져온 파일만 바뀌었는지 확인한다
+git commit -m "템플릿 수정 반영"
+git push
+```
+
+코딩 에이전트에게 맡길 때:
+
+```text
+88chacha/friend-agent-template 저장소를 template 이라는 이름의 remote로 추가하고(이미 있으면 건너뛰고) fetch 해 줘.
+template/main 에서 <파일 경로> 파일만 가져와서 커밋해 줘. 다른 파일은 건드리지 마.
+```
+
+가져온 파일을 내가 이미 고쳐 두었다면 내 변경은 템플릿의 내용으로 덮어써집니다. 실행하기 전에 `git diff template/main -- <파일 경로>` 로 무엇이 바뀌는지 먼저 봅니다. 템플릿 전체를 합치는 `git merge template/main --allow-unrelated-histories` 는 내가 고친 파일마다 충돌이 나기 쉬워 쓰지 않습니다.
