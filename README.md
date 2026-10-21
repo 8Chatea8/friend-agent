@@ -60,13 +60,12 @@ cd <저장소 이름>
 | `docs/` | 동작 예시(`examples.md`), 실습별 시작 상태(`start-states.md`), 배포 기록 양식, Supabase 연결 절차, GitHub Actions 배포 권한 절차(`wif-setup.md`), 운영 절차(`runbook.md`)와 카나리 판단 기준(`canary-criteria.md`) 양식 |
 | `starter/` | 실습 단계마다 꺼내 쓰는 워크플로, Dockerfile 예시, 일부러 넣어 보는 변경(`starter/README.md`) |
 | `data/samples/` | 사진 글자 읽기 실습용 일정표 사진 |
-| `JOURNEY.md` | 작업 일지 양식 |
 
 ## 환경변수
 
 | 이름 | 값 | 설명 |
 | --- | --- | --- |
-| `LLM_PROVIDER` | `openai`, `gemini`, `fake` | 기본값 `openai`. `fake` 는 키 없이 가짜 응답을 돌려준다 |
+| `LLM_PROVIDER` | `openai`, `gemini`, `claude`, `fake` | 기본값 `openai`. `fake` 는 키 없이 가짜 응답을 돌려준다. `claude` 의 기본 모델은 `claude-opus-5-5` 이고, `LLM_MODEL=claude-haiku-5-5` 처럼 바꿀 수 있다 |
 | `LLM_API_KEY` | AI 회사 API 키 | `fake` 가 아니면 필수. 없으면 앱이 시작하지 않는다 |
 | `LLM_MODEL` | 모델 이름 | 비우면 제공자별 기본값(`gpt-4o-mini` 등)을 쓴다 |
 | `ENV` | `local`, `staging`, `production` | `staging` 이면 화면 위에 테스트 환경 표시. `production` 이면 개발용 패널이 기본으로 꺼짐 |
@@ -165,6 +164,3 @@ gcloud run deploy friend-agent --source . --region us-central1 --allow-unauthent
 | 공휴일 | [Nager.Date](https://date.nager.at/) | 키 없음 |
 
 공개 지오코딩 API는 한국어 지명을 잘못 찾는 경우가 있어서, 지원 도시 26곳의 좌표를 `app/tools.py` 에 직접 적어 두었습니다.
-
----
-"이 저장소는 CLoud Run 배포 실습용으로 만들어졌습니다."
