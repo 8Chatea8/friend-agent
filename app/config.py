@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PROVIDERS = {
     "openai": {"base_url": None, "model": "gpt-4o-mini"},
     "gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai/", "model": "gemini-3.8-flash"},
+    "claude": {"base_url": None, "model": "claude-opus-5-5"},
     "fake": {"base_url": None, "model": "fake"},
 }
 
@@ -68,7 +69,7 @@ def load_settings():
 
     provider = os.environ.get("LLM_PROVIDER", "openai").strip().lower()
     if provider not in PROVIDERS:
-        stop(f"LLM_PROVIDER 값 '{provider}' 를 알 수 없어 앱을 시작하지 않습니다. openai, gemini, fake 중 하나를 쓰세요.")
+        stop(f"LLM_PROVIDER 값 '{provider}' 를 알 수 없어 앱을 시작하지 않습니다. openai, gemini, claude, fake 중 하나를 쓰세요.")
 
     api_key = os.environ.get("LLM_API_KEY", "").strip()
     if provider != "fake" and not api_key:
