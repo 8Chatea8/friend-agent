@@ -7,7 +7,7 @@ app = FastAPI()
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return "<h1>안녕하세요, hello 앱입니다</h1>"
+    return "<h1>사실 세번째 배포입니다</h1>"
 
 
 @app.get("/health")
