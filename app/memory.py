@@ -8,6 +8,7 @@ import re
 
 from app import when
 from app.logs import log
+from app.observe import NOOP
 from app.safety import is_sensitive
 
 RECENT_TURNS = 10            # 답에 넣는 최근 대화(턴 = 사용자 + 캐릭터 메시지 한 쌍)
@@ -75,18 +76,25 @@ def rule_extract(message):
     return {"add": found, "update": [], "remove": []}
 
 
-def update_memories(store, uid, user_message, reply, now, llm):
+def update_memories(store, uid, user_message, reply, now, llm, obs=NOOP):
     """방금 턴에서 기억할 것을 뽑아 저장한다. 바뀐 내용을 돌려준다(화면 표시용)."""
     existing = store.list_memories(uid)
-    if getattr(llm, "can_reason", False):
+    gen = obs.generation("memory-update", model=getattr(llm, "model", "unknown"))
+    usage = {}
+    decided_by = "model" if getattr(llm, "can_reason", False) else "rule"
+    if decided_by == "model":
         listed = "\n".join(f"- id={m['id']} ({m['kind']}) {m['text']}" for m in existing) or "(없음)"
         user = f"[지금] {now:%Y-%m-%d %H:%M}\n[달력]\n{when.calendar_hint(now)}\n[이미 있는 기억]\n{listed}\n\n[대화]\nuser: {user_message}\nassistant: {reply}"
+        gen.update(input=[{"role": "system", "content": EXTRACT_PROMPT}, {"role": "user", "content": user}])
         try:
-            plan = llm.complete_json(EXTRACT_PROMPT, user)
+            plan = llm.complete_json(EXTRACT_PROMPT, user, usage=usage)
         except Exception as error:
             log("WARNING", "기억 정리 실패", error=type(error).__name__)
+            gen.end(usage=usage, level="WARNING", status_message=f"기억 정리 실패: {type(error).__name__}",
+                    metadata={"decided_by": decided_by, "existing": len(existing)})
             return {"added": [], "updated": [], "removed": []}
     else:
+        gen.update(input=user_message)
         plan = rule_extract(user_message)
 
     known_ids = {m["id"]: m for m in existing}
@@ -109,10 +117,13 @@ def update_memories(store, uid, user_message, reply, now, llm):
             changes["removed"].append({"id": memory_id, "text": known_ids[memory_id]["text"]})
     if any(changes.values()):
         log("INFO", "기억 정리", added=len(changes["added"]), updated=len(changes["updated"]), removed=len(changes["removed"]))
+    gen.end(output=plan, usage=usage,
+            metadata={"decided_by": decided_by, "existing": len(existing), "added": len(changes["added"]),
+                      "updated": len(changes["updated"]), "removed": len(changes["removed"])})
     return changes
 
 
-def maybe_summarize(store, uid, llm):
+def maybe_summarize(store, uid, llm, obs=NOOP):
     """요약되지 않은 메시지가 많으면 앞쪽을 요약에 합친다. 요약했으면 True."""
     summary = store.get_summary(uid)
     pending = store.messages_after(uid, summary["covers_until"] if summary else 0)
@@ -121,11 +132,19 @@ def maybe_summarize(store, uid, llm):
     batch = pending[:SUMMARIZE_BATCH]
     talk = "\n".join(f"{m['role']}: {m['content']}" for m in batch)
     previous = f"[기존 요약]\n{summary['text']}\n\n" if summary else ""
-    if getattr(llm, "can_reason", False):
-        text = llm.complete_text([{"role": "system", "content": SUMMARY_PROMPT},
-                                  {"role": "user", "content": f"{previous}[대화]\n{talk}"}])
-    else:
-        text = ((summary["text"] + " ") if summary else "") + f"메시지 {len(batch)}개를 주고받았다."
+    messages = [{"role": "system", "content": SUMMARY_PROMPT}, {"role": "user", "content": f"{previous}[대화]\n{talk}"}]
+    decided_by = "model" if getattr(llm, "can_reason", False) else "rule"
+    gen = obs.generation("memory-summary", model=getattr(llm, "model", "unknown"), input=messages)
+    usage = {}
+    try:
+        if decided_by == "model":
+            text = llm.complete_text(messages, usage=usage)
+        else:
+            text = ((summary["text"] + " ") if summary else "") + f"메시지 {len(batch)}개를 주고받았다."
+    except Exception as error:
+        gen.end(usage=usage, level="ERROR", status_message=type(error).__name__)
+        raise
     store.save_summary(uid, text[:2000], batch[-1]["id"])
     log("INFO", "대화 요약 갱신", covered=len(batch))
+    gen.end(output=text[:2000], usage=usage, metadata={"decided_by": decided_by, "covered": len(batch)})
     return True

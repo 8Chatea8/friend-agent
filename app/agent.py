@@ -9,10 +9,13 @@
    응답 뒤 백그라운드로 돌리면 기억 정리가 멈추거나 늦어진다. 그래서 응답을 닫기 전에 처리한다.
 
 결과는 이벤트(dict)로 하나씩 내보낸다. show_panel 이 꺼져 있으면(production) 개발용 이벤트는 아예 만들지 않는다.
+
+Langfuse 계측(observe.py): 한 턴은 chat-turn 트레이스이고, 그 안에 safety, choose-tools, tool:<도구 이름>, reply,
+memory-update, memory-summary 를 남긴다. 먼저 말 걸기는 greeting 트레이스다.
 """
 from datetime import timedelta
 
-from app import memory, when
+from app import memory, observe, when
 from app.logs import log
 from app.persona import DEFAULT_CHARACTER, build_persona
 from app.router import choose
@@ -35,7 +38,20 @@ def system_prompt(character, now, location, memories, summary, tool_lines=(), cl
     return "\n\n".join(parts)
 
 
-def run_turn(message, uid, llm, store, show_panel):
+def run_turn(message, uid, llm, store, show_panel, tracer=observe.DISABLED):
+    trace = tracer.trace("chat-turn", input=message, user_id=uid)
+    outcome = {}  # 트레이스를 닫을 때 남길 답과 요약 정보. _turn 이 채운다
+    try:
+        yield from _turn(message, uid, llm, store, show_panel, trace, outcome)
+    except Exception as error:
+        trace.update(level="ERROR", status_message=type(error).__name__)
+        raise
+    finally:  # 오류가 나거나 사용자가 연결을 끊어도 트레이스를 닫고, 응답을 닫기 전에 보낸다
+        trace.end(output=outcome.get("reply"), metadata=outcome.get("meta"))
+        tracer.flush()
+
+
+def _turn(message, uid, llm, store, show_panel, trace, outcome):
     settings = store.get_settings(uid)
     character = store.get_character(uid) or DEFAULT_CHARACTER
     now = when.now_in(settings["timezone"])
@@ -43,8 +59,15 @@ def run_turn(message, uid, llm, store, show_panel):
     history = [{"role": m["role"], "content": m["content"]} for m in recent]
     store.add_message(uid, "user", message)
 
-    # ① 위기 표현
-    if is_crisis(message):
+    # ① 위기 표현. 판정을 먼저 하고 span 을 만든다. 위기 응답이면 뒤에 다른 span 이 없어서,
+    #    안전 응답 여부와 태그를 이 span 이 가져야 트레이스에 남는다
+    crisis = is_crisis(message)
+    trace.set_trace(metadata={"safety": crisis})
+    if crisis:
+        trace.set_trace(metadata={"tools": []}, tags=["안전 응답"])
+    span = trace.span("safety", input=message)
+    span.end(metadata={"crisis": crisis})
+    if crisis:
         guards = ["위기 표현이 있어 캐릭터 설정과 상관없이 정해진 안전 응답을 보냈습니다."]
         if show_panel:
             yield {"type": "turn", "tools": [], "confidence": None, "reason": "", "decided_by": "rule",
@@ -52,11 +75,15 @@ def run_turn(message, uid, llm, store, show_panel):
         yield {"type": "delta", "text": CRISIS_REPLY}
         saved = store.add_message(uid, "assistant", CRISIS_REPLY, {"action": "safety", "guards": guards})
         log("WARNING", "위기 표현 안전 응답")
+        outcome.update(reply=CRISIS_REPLY, meta={"action": "safety"})
         yield {"type": "done", "message_id": saved["id"]}
         return
 
     # ② 도구 선택
-    choice = choose(message, history, now, settings["location"], llm)
+    choice = choose(message, history, now, settings["location"], llm, trace)
+    # 최종 도구(되묻기면 비어 있음)와 확신도. 이 뒤의 tool·reply·memory span 부터 붙는다
+    picked = [t["name"] for t in choice.tools]
+    trace.set_trace(metadata={"tools": picked, "confidence": round(choice.confidence, 2)}, tags=picked or ["기타"])
     if show_panel:
         yield {"type": "turn", "tools": [{"name": t["name"], "label": TOOLS[t["name"]]["label"], "args": t["args"]}
                                          for t in choice.tools],
@@ -65,7 +92,16 @@ def run_turn(message, uid, llm, store, show_panel):
 
     # ③ 도구 실행
     ctx = Context(store, uid, settings["location"], settings["timezone"])
-    results = [run_tool(t["name"], t["args"], ctx) for t in choice.tools]
+    results = []
+    for t in choice.tools:
+        span = trace.span(f"tool:{t['name']}", input=t["args"])
+        try:
+            r = run_tool(t["name"], t["args"], ctx)
+        except Exception as error:
+            span.end(metadata={"ok": False}, level="ERROR", status_message=type(error).__name__)
+            raise
+        span.end(output=r.summary, metadata={"ok": r.ok}, level=None if r.ok else "WARNING")
+        results.append(r)
     for r in results:
         if show_panel:
             yield {"type": "tool", "name": r.name, "label": TOOLS[r.name]["label"], "ok": r.ok,
@@ -79,24 +115,34 @@ def run_turn(message, uid, llm, store, show_panel):
     if show_panel:
         yield {"type": "context", "memories": [m["text"] for m in memories],
                "summary": summary["text"] if summary else None, "recent_messages": len(history)}
-    reply = ""
-    for chunk in llm.chat_stream([{"role": "system", "content": system}, *history, {"role": "user", "content": message}]):
-        reply += chunk
-        yield {"type": "delta", "text": chunk}
+    messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": message}]
+    gen = trace.generation("reply", model=getattr(llm, "model", "unknown"), input=messages)
+    reply, usage, first_chunk_at = "", {}, None
+    try:
+        for chunk in llm.chat_stream(messages, usage=usage):
+            if first_chunk_at is None:
+                first_chunk_at = observe.now()  # 답의 첫 글자가 나온 시각
+            reply += chunk
+            yield {"type": "delta", "text": chunk}
+    finally:
+        gen.end(output=reply, usage=usage, completion_start_time=first_chunk_at,
+                metadata={"history_messages": len(history), "tool_results": len(results)})
     meta = {"tools": [t["name"] for t in choice.tools], "confidence": choice.confidence,
             "action": choice.action, "guards": choice.guards}
     saved = store.add_message(uid, "assistant", reply, meta)
+    outcome.update(reply=reply, meta={"action": choice.action, "tools": meta["tools"],
+                                      "decided_by": choice.decided_by})
 
     # ⑤ 기억 정리
     yield {"type": "memory_start"}
-    changes = memory.update_memories(store, uid, message, reply, now, llm)
-    memory.maybe_summarize(store, uid, llm)
+    changes = memory.update_memories(store, uid, message, reply, now, llm, trace)
+    memory.maybe_summarize(store, uid, llm, trace)
     yield {"type": "memory", "added": [m["text"] for m in changes["added"]],
            "updated": [m["text"] for m in changes["updated"]], "removed": [m["text"] for m in changes["removed"]]}
     yield {"type": "done", "message_id": saved["id"]}
 
 
-def greet(uid, llm, store):
+def greet(uid, llm, store, tracer=observe.DISABLED):
     """앱을 열 때 먼저 말을 건다. 때가 된 약속이 있거나, 대화가 처음이거나, 오래 쉬었을 때만.
 
     약속은 '전달됨'으로 바꾸는 데 성공한 것만 전한다. 창을 두 개 열어도 같은 약속을 두 번 전하지 않는다.
@@ -118,8 +164,20 @@ def greet(uid, llm, store):
     if not last:
         guide.append("처음 만난 사이다. 이름을 넣어 짧게 자기소개를 한다.")
     system += "\n\n[먼저 말 걸기]\n" + " ".join(guide)
-    text = llm.complete_text([{"role": "system", "content": system},
-                              {"role": "user", "content": "(앱을 열었다. 먼저 말을 걸어 줘)"}])
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": "(앱을 열었다. 먼저 말을 걸어 줘)"}]
+    # 먼저 말 걸기는 LLM 호출 하나라서, 트레이스의 루트 자체를 generation 으로 둔다
+    gen = tracer.trace("greeting", as_type="generation", model=getattr(llm, "model", "unknown"), input=messages,
+                       metadata={"reminders": len(due), "first_meeting": not last}, user_id=uid,
+                       trace_metadata={"tools": [], "safety": False}, tags=["기타"])
+    usage = {}
+    try:
+        text = llm.complete_text(messages, usage=usage)
+    except Exception as error:
+        gen.end(usage=usage, level="ERROR", status_message=type(error).__name__)
+        tracer.flush()
+        raise
     saved = store.add_message(uid, "assistant", text, {"action": "greeting", "reminders": [r["id"] for r in due]})
     log("INFO", "먼저 말 걸기", reminders=len(due))
+    gen.end(output=text, usage=usage)
+    tracer.flush()
     return {"id": saved["id"], "text": text, "reminders": [r["text"] for r in due]}

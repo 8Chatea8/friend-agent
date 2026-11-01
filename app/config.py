@@ -38,6 +38,10 @@ class Settings:
     google_login: bool
     show_turn_panel: bool
     ocr_enabled: bool
+    langfuse_public_key: str
+    langfuse_secret_key: str
+    langfuse_base_url: str
+    langfuse_capture_content: bool
 
 
 def load_dotenv(path):
@@ -111,7 +115,15 @@ def load_settings():
         # 개발용 "이번 턴" 패널. production 에서는 기본으로 끈다.
         show_turn_panel=env_flag("SHOW_TURN_PANEL", env != "production"),
         ocr_enabled=env_flag("OCR_ENABLED", False),  # 사진 글자 읽기. tesseract 프로그램이 필요하다
+        # Langfuse 계측. 두 키가 다 있을 때만 켠다. secret key 는 Secret Manager 에 두고 이름으로 연결한다
+        langfuse_public_key=os.environ.get("LANGFUSE_PUBLIC_KEY", "").strip(),
+        langfuse_secret_key=os.environ.get("LANGFUSE_SECRET_KEY", "").strip(),
+        langfuse_base_url=os.environ.get("LANGFUSE_BASE_URL", "").strip().rstrip("/"),
+        # 대화 원문(전화번호, 이메일, 카드 번호는 가림)을 보낼지. 개인정보라 기본값은 끔
+        langfuse_capture_content=env_flag("LANGFUSE_CAPTURE_CONTENT", False),
     )
     log("INFO", "앱을 시작합니다.", provider=settings.provider, model=settings.model, env=settings.env,
-        storage=settings.storage, auth=settings.auth, turn_panel=settings.show_turn_panel)
+        storage=settings.storage, auth=settings.auth, turn_panel=settings.show_turn_panel,
+        langfuse=bool(settings.langfuse_public_key and settings.langfuse_secret_key),
+        langfuse_content=settings.langfuse_capture_content)
     return settings

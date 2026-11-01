@@ -10,6 +10,7 @@ from datetime import date, timedelta
 
 from app import when
 from app.logs import log
+from app.observe import NOOP
 from app.tools import CITIES, TOOLS
 
 CONFIDENCE_THRESHOLD = 0.6
@@ -112,11 +113,14 @@ def rule_choose(message, now, location):
 
 # ── 모델 ────────────────────────────────────────────────────────────
 
-def model_choose(message, history, now, location, llm):
+def model_choose(message, history, now, location, llm, gen=NOOP, usage=None):
     recent = "\n".join(f"{m['role']}: {m['content']}" for m in history[-4:]) or "(없음)"
     user = (f"[지금] {now.isoformat()} ({when.WEEKDAYS[now.weekday()]}요일)\n[달력]\n{when.calendar_hint(now)}\n"
             f"[사용자 지역] {location}\n[최근 대화]\n{recent}\n\n[메시지]\n{message}")
-    data = llm.complete_json(router_prompt(), user)
+    system = router_prompt()
+    gen.update(input=[{"role": "system", "content": system}, {"role": "user", "content": user}])
+    data = llm.complete_json(system, user, usage=usage)
+    gen.update(output=data)  # 모델이 보낸 JSON 그대로. 앱이 고친 최종 결과는 choose() 가 metadata 로 남긴다
     tools = []
     for t in data.get("tools") or []:
         if isinstance(t, dict) and t.get("name") in TOOLS:
@@ -134,15 +138,19 @@ def model_choose(message, history, now, location, llm):
     return result
 
 
-def choose(message, history, now, location, llm):
+def choose(message, history, now, location, llm, obs=NOOP):
+    gen = obs.generation("choose-tools", model=getattr(llm, "model", "unknown"))
+    usage = {}
     if getattr(llm, "can_reason", False):
         try:
-            result = model_choose(message, history, now, location, llm)
+            result = model_choose(message, history, now, location, llm, gen, usage)
         except Exception as error:  # 모델 응답이 형식에 맞지 않으면 규칙으로 대신한다
             log("WARNING", "모델 도구 선택 실패, 키워드 규칙으로 대신함", error=type(error).__name__)
+            gen.update(level="WARNING", status_message=f"모델 응답을 읽지 못함: {type(error).__name__}")
             result = rule_choose(message, now, location)
             result.guards.append("모델 응답을 읽지 못해 키워드 규칙으로 골랐습니다.")
     else:
+        gen.update(input=message)
         result = rule_choose(message, now, location)
 
     # 안전장치: 확신이 낮으면 도구를 쓰지 않고 되묻는다
@@ -153,4 +161,12 @@ def choose(message, history, now, location, llm):
 
     log("INFO", "도구 선택", tools=[t["name"] for t in result.tools], confidence=round(result.confidence, 2),
         decided_by=result.decided_by, action=result.action)
+    if result.decided_by == "rule":
+        # 규칙은 JSON 을 내지 않으므로 모델 답과 같은 모양으로 만들어 남긴다
+        gen.update(output={"tools": result.tools, "confidence": result.confidence, "reason": result.reason})
+    # metadata 는 앱이 처리한 최종 결과다(되묻기로 바뀌면 tools 가 비고 action 이 clarify).
+    # 인자(args)와 이유(reason)에는 사용자 말이 들어갈 수 있어 metadata 에 넣지 않는다
+    gen.end(usage=usage,
+            metadata={"tools": [t["name"] for t in result.tools], "confidence": round(result.confidence, 2),
+                      "decided_by": result.decided_by, "action": result.action, "guards": len(result.guards)})
     return result
