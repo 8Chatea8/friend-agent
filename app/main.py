@@ -23,6 +23,7 @@ from app.auth import Auth, User
 from app.config import ROOT, load_settings
 from app.llm import make_llm
 from app.logs import log
+from app.observe import make_tracer
 from app.persona import DEFAULT_CHARACTER, OPTIONS, build_persona, clean_character
 from app.store.base import make_store
 from app.tools import CITIES
@@ -30,6 +31,7 @@ from app.tools import CITIES
 settings = load_settings()  # 꼭 필요한 값이 없으면 여기서 종료한다
 llm = make_llm(settings)
 store = make_store(settings)
+tracer = make_tracer(settings)  # LANGFUSE 키가 없으면 아무것도 하지 않는다
 current_user = Auth(settings)
 
 app = FastAPI(title="AI 친구 에이전트")
@@ -161,7 +163,7 @@ def chat(req: ChatRequest, user: User = Depends(current_user), model=Depends(get
 
     def events():
         try:
-            for event in agent.run_turn(message, user.id, model, store, settings.show_turn_panel):
+            for event in agent.run_turn(message, user.id, model, store, settings.show_turn_panel, tracer):
                 yield json.dumps(event, ensure_ascii=False, default=str) + "\n"
         except Exception as error:
             log("ERROR", "대화 처리 실패", error=type(error).__name__)
@@ -172,7 +174,7 @@ def chat(req: ChatRequest, user: User = Depends(current_user), model=Depends(get
 
 @app.post("/api/greeting")
 def greeting(user: User = Depends(current_user), model=Depends(get_llm)):
-    return {"greeting": agent.greet(user.id, model, store)}
+    return {"greeting": agent.greet(user.id, model, store, tracer)}
 
 
 @app.post("/api/ocr")
