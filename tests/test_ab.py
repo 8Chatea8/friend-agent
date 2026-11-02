@@ -96,3 +96,29 @@ def test_trace_gets_ab_variant_and_linked_prompt(monkeypatch):
     assert span.attributes["langfuse.observation.prompt.name"] == ROUTER_PROMPT_NAME
     assert span.attributes["langfuse.observation.prompt.version"] == 4
     assert fake.asked == ["prod-b"]
+
+
+def test_root_span_carries_ab_variant_confidence_and_safety(monkeypatch):
+    """Langfuse 화면의 트레이스 metadata 는 루트 span 의 값이라, 루트에 있어야 그룹별로 거를 수 있다."""
+    class JsonLLM:
+        can_reason, model = True, "json-model"
+
+        def complete_json(self, system, user, usage=None):
+            return {"tools": [], "confidence": 0.9, "reason": "일상"}
+
+        def chat_stream(self, messages, usage=None):
+            yield "응"
+
+    key = uuid.uuid4().hex
+    settings = SimpleNamespace(langfuse_public_key=f"pk-{key}", langfuse_secret_key=f"sk-{key}",
+                               langfuse_base_url="http://127.0.0.1:9", env="staging", commit="c",
+                               langfuse_capture_content=False, ab_test=True)
+    exporter = InMemorySpanExporter()
+    tracer = observe.make_tracer(settings, span_exporter=exporter)
+    monkeypatch.setattr(tracer.client, "get_prompt", FakeClient(production=1, prod_a=3, prod_b=4).get_prompt)
+    uid = user_in("a")
+    list(agent.run_turn("안녕", uid, JsonLLM(), MemoryStore(), False, tracer))
+    root = next(s for s in exporter.get_finished_spans() if s.name == "chat-turn")
+    assert json.loads(root.attributes["langfuse.trace.metadata.ab_variant"]) == "a"
+    assert json.loads(root.attributes["langfuse.observation.metadata.confidence"]) == 0.9
+    assert json.loads(root.attributes["langfuse.observation.metadata.safety"]) is False

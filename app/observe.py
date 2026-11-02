@@ -256,6 +256,11 @@ class Tracer:
         if user_id:
             attrs["user_id"] = str(user_id)
             attrs["session_id"] = f"{user_id}:{datetime.now(KST).date().isoformat()}"
+            # A/B 그룹은 사용자 ID 만으로 정해지므로 루트를 만들기 전에 넣는다.
+            # Langfuse 화면의 트레이스 metadata 는 루트 span 의 값을 보여 준다
+            variant = self.variant_for(user_id)
+            if variant:
+                attrs["metadata"]["ab_variant"] = variant
         root = Observation(self.client, self.capture, attrs, self)
         root.set_trace(metadata=trace_metadata, tags=tags)
         return root._child(name, as_type, input, metadata, model)
