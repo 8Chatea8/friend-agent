@@ -80,6 +80,7 @@ cd <저장소 이름>
 | `COMMIT_SHA` | 커밋 해시 | `/version` 에 표시된다. 자동 배포에서 넣는다 |
 | `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | `pk-lf-...`, `sk-lf-...` | Langfuse 계측. 둘 다 있을 때만 켜진다. secret key 는 Secret Manager에 둔다 |
 | `LANGFUSE_BASE_URL` | 주소 | 비우면 Langfuse Cloud 기본 주소 |
+| `AB_TEST` | `on`, `off` | 도구 선택 프롬프트(`tool-router`) A/B 테스트. `on` 이면 사용자 ID 해시로 `prod-a`/`prod-b` 라벨을 고정 배정하고 트레이스 metadata 에 `ab_variant` 를 남긴다. 못 가져오면 `production` 라벨. 기본값 `off` |
 | `LANGFUSE_CAPTURE_CONTENT` | `true`, `false` | 대화 입력·출력 원문을 Langfuse에 보낼지. 기본값 `false`(크기만 보냄). `true` 여도 전화번호, 이메일, 카드 번호는 가린다 |
 | `BANNER` | 짧은 문구 | 화면 위에 띠로 보이고 `/version` 에도 나온다. 이미지를 새로 만들지 않고 새 리비전을 만들어 볼 때 쓴다 |
 | `SLOW_START_SECONDS` | 초 | 배포 실습용 시작 지연. 포트는 바로 열지만 이 시간 동안 모든 요청(`/health` 포함)에 503을 돌려준다. 기본값 0 |
