@@ -82,7 +82,7 @@ def _turn(message, uid, llm, store, show_panel, trace, outcome):
         yield {"type": "delta", "text": CRISIS_REPLY}
         saved = store.add_message(uid, "assistant", CRISIS_REPLY, with_trace({"action": "safety", "guards": guards}, trace))
         log("WARNING", "위기 표현 안전 응답")
-        outcome.update(reply=CRISIS_REPLY, meta={"action": "safety"})
+        outcome.update(reply=CRISIS_REPLY, meta={"action": "safety", "tools": [], "safety": True})
         yield {"type": "done", "message_id": saved["id"]}
         return
 
@@ -137,8 +137,10 @@ def _turn(message, uid, llm, store, show_panel, trace, outcome):
     meta = {"tools": [t["name"] for t in choice.tools], "confidence": choice.confidence,
             "action": choice.action, "guards": choice.guards}
     saved = store.add_message(uid, "assistant", reply, with_trace(meta, trace))
+    # 루트(chat-turn)를 닫을 때 남기는 값. Langfuse 화면의 트레이스 metadata 는 루트 span 의 값을 보여 준다
     outcome.update(reply=reply, meta={"action": choice.action, "tools": meta["tools"],
-                                      "decided_by": choice.decided_by})
+                                      "decided_by": choice.decided_by,
+                                      "confidence": round(choice.confidence, 2), "safety": False})
 
     # ⑤ 기억 정리
     yield {"type": "memory_start"}
