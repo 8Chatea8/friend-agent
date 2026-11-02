@@ -13,6 +13,7 @@ import html
 import json
 import os
 import time
+from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -68,6 +69,7 @@ class SettingsRequest(BaseModel):
 class ReportRequest(BaseModel):
     message_id: int
     reason: str = ""
+    kind: Literal["report", "like", "dislike"] = "report"  # 기본값 report: 예전 신고 요청도 그대로 받는다
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -189,9 +191,21 @@ async def read_photo(photo: UploadFile, user: User = Depends(current_user)):
 
 @app.post("/api/report")
 def report(req: ReportRequest, user: User = Depends(current_user)):
-    # 지금은 로그로만 남긴다. 관측 도구를 붙이면 그 도구의 점수로 보낸다.
-    log("WARNING", "부적절한 답변 신고", message_id=req.message_id, reason_length=len(req.reason))
-    return {"ok": True}
+    """답에 대한 사용자 반응. 좋아요·별로예요는 user-feedback(1/0), 신고는 report(1) 점수로 Langfuse 트레이스에 붙인다.
+
+    로그인한 사용자의 답 메시지인지 서버에서 확인한다. Langfuse 키가 없거나 트레이스 ID가 없는 메시지면 점수는 건너뛴다.
+    """
+    message = store.get_message(user.id, req.message_id)
+    if not message or message["role"] != "assistant":
+        raise HTTPException(404, "메시지를 찾을 수 없습니다")
+    trace_id = (message.get("meta") or {}).get("trace_id")
+    if req.kind == "report":
+        scored = tracer.score(trace_id, "report", 1, comment=req.reason or None, timestamp=message["created_at"])
+        log("WARNING", "부적절한 답변 신고", message_id=req.message_id, reason_length=len(req.reason), scored=scored)
+    else:
+        scored = tracer.score(trace_id, "user-feedback", 1 if req.kind == "like" else 0, timestamp=message["created_at"])
+        log("INFO", "답변 반응", message_id=req.message_id, kind=req.kind, scored=scored)
+    return {"ok": True, "scored": scored}
 
 
 # ── 기억, 약속, 내 데이터 ───────────────────────────────────────────

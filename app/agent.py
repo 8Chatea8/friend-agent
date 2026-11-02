@@ -38,6 +38,13 @@ def system_prompt(character, now, location, memories, summary, tool_lines=(), cl
     return "\n\n".join(parts)
 
 
+def with_trace(meta, obs):
+    """답 메시지 meta 에 트레이스 ID 를 남긴다. 나중에 사용자 반응(좋아요, 신고)을 이 트레이스의 점수로 붙인다."""
+    if obs.trace_id:
+        meta["trace_id"] = obs.trace_id
+    return meta
+
+
 def run_turn(message, uid, llm, store, show_panel, tracer=observe.DISABLED):
     trace = tracer.trace("chat-turn", input=message, user_id=uid)
     outcome = {}  # 트레이스를 닫을 때 남길 답과 요약 정보. _turn 이 채운다
@@ -73,7 +80,7 @@ def _turn(message, uid, llm, store, show_panel, trace, outcome):
             yield {"type": "turn", "tools": [], "confidence": None, "reason": "", "decided_by": "rule",
                    "action": "safety", "guards": guards}
         yield {"type": "delta", "text": CRISIS_REPLY}
-        saved = store.add_message(uid, "assistant", CRISIS_REPLY, {"action": "safety", "guards": guards})
+        saved = store.add_message(uid, "assistant", CRISIS_REPLY, with_trace({"action": "safety", "guards": guards}, trace))
         log("WARNING", "위기 표현 안전 응답")
         outcome.update(reply=CRISIS_REPLY, meta={"action": "safety"})
         yield {"type": "done", "message_id": saved["id"]}
@@ -129,7 +136,7 @@ def _turn(message, uid, llm, store, show_panel, trace, outcome):
                 metadata={"history_messages": len(history), "tool_results": len(results)})
     meta = {"tools": [t["name"] for t in choice.tools], "confidence": choice.confidence,
             "action": choice.action, "guards": choice.guards}
-    saved = store.add_message(uid, "assistant", reply, meta)
+    saved = store.add_message(uid, "assistant", reply, with_trace(meta, trace))
     outcome.update(reply=reply, meta={"action": choice.action, "tools": meta["tools"],
                                       "decided_by": choice.decided_by})
 
@@ -176,7 +183,8 @@ def greet(uid, llm, store, tracer=observe.DISABLED):
         gen.end(usage=usage, level="ERROR", status_message=type(error).__name__)
         tracer.flush()
         raise
-    saved = store.add_message(uid, "assistant", text, {"action": "greeting", "reminders": [r["id"] for r in due]})
+    saved = store.add_message(uid, "assistant", text,
+                              with_trace({"action": "greeting", "reminders": [r["id"] for r in due]}, gen))
     log("INFO", "먼저 말 걸기", reminders=len(due))
     gen.end(output=text, usage=usage)
     tracer.flush()

@@ -68,10 +68,20 @@ class Observation:
     attrs 는 트레이스 속성이다. 한 트레이스의 루트와 자식이 같은 dict 를 함께 쓴다.
     """
 
-    def __init__(self, raw=None, capture=False, attrs=None):
+    def __init__(self, raw=None, capture=False, attrs=None, tracer=None):
         self.raw = raw
         self.capture = capture
         self.attrs = attrs if attrs is not None else {}
+        self.tracer = tracer
+
+    def get_prompt(self, name, fallback=None):
+        """Langfuse 프롬프트 관리에서 프롬프트를 가져온다. 못 가져오면 None(코드 문장을 쓴다)."""
+        return self.tracer.get_prompt(name, fallback) if self.tracer else None
+
+    @property
+    def trace_id(self):
+        """이 관찰이 속한 트레이스 ID. 메시지 meta 에 저장해 두었다가 사용자 반응 점수를 붙인다."""
+        return getattr(self.raw, "trace_id", None)
 
     def set_trace(self, metadata=None, tags=None):
         """턴 중간에 알게 된 트레이스 속성. 이 뒤에 만드는 span 부터 붙는다."""
@@ -98,25 +108,27 @@ class Observation:
             log("WARNING", "Langfuse 계측 실패", step=what, error=type(error).__name__)
             return None
 
-    def _child(self, name, as_type, input=None, metadata=None, model=None):
+    def _child(self, name, as_type, input=None, metadata=None, model=None, prompt=None):
         kwargs = {"name": name, "as_type": as_type, "metadata": metadata}
         if input is not None:
             kwargs["input"] = self._content(input)
         if model is not None:
             kwargs["model"] = model
+        if prompt is not None:  # 트레이스에서 프롬프트 이름과 버전이 보인다
+            kwargs["prompt"] = prompt
 
         def start():
             with self._propagate():  # 만드는 순간에만 감싼다. 스트리밍 중 다른 스레드로 넘어가도 문제없다
                 return self.raw.start_observation(**kwargs)
 
         raw = self._call(name, start)
-        return Observation(raw, self.capture, self.attrs)
+        return Observation(raw, self.capture, self.attrs, self.tracer)
 
     def span(self, name, input=None, metadata=None):
         return self._child(name, "span", input, metadata)
 
-    def generation(self, name, model, input=None, metadata=None):
-        return self._child(name, "generation", input, metadata, model)
+    def generation(self, name, model, input=None, metadata=None, prompt=None):
+        return self._child(name, "generation", input, metadata, model, prompt)
 
     def update(self, input=None, output=None, metadata=None, model=None, usage=None,
                completion_start_time=None, level=None, status_message=None):
@@ -151,11 +163,35 @@ NOOP = Observation()
 
 
 class Tracer:
-    def __init__(self, client=None, capture=False, version="local", commit="local"):
+    def __init__(self, client=None, capture=False, version="local", commit="local", prompt_label="staging"):
         self.client = client
         self.capture = capture
         self.version = version  # Cloud Run 이 넣어 주는 K_REVISION. 없으면 local
         self.commit = commit    # COMMIT_SHA
+        self.prompt_label = prompt_label  # ENV 가 production 이면 production, 그 밖에는 staging
+        self._prompt_warned = set()
+
+    def get_prompt(self, name, fallback=None):
+        """프롬프트 관리에서 prompt_label 의 버전을 가져온다. SDK 가 캐시하므로 매번 서버에 묻지 않는다.
+
+        키가 없거나, 가져오지 못해 SDK 가 fallback 문장을 돌려주면 None 을 돌려준다.
+        그러면 부른 쪽이 코드에 남겨 둔 같은 문장을 쓰고, 그 generation 에는 프롬프트를 연결하지 않는다.
+        """
+        if self.client is None:
+            return None
+        try:
+            prompt = self.client.get_prompt(name, label=self.prompt_label, type="text", fallback=fallback)
+        except Exception as error:
+            prompt, reason = None, type(error).__name__
+        else:
+            reason = "fallback" if getattr(prompt, "is_fallback", False) else None
+        if reason is None:
+            return prompt
+        if name not in self._prompt_warned:  # 같은 경고가 턴마다 쌓이지 않게 한 번만 남긴다
+            self._prompt_warned.add(name)
+            log("WARNING", "Langfuse 프롬프트를 가져오지 못해 코드 문장을 씁니다", prompt=name,
+                label=self.prompt_label, reason=reason)
+        return None
 
     @property
     def enabled(self):
@@ -174,9 +210,33 @@ class Tracer:
         if user_id:
             attrs["user_id"] = str(user_id)
             attrs["session_id"] = f"{user_id}:{datetime.now(KST).date().isoformat()}"
-        root = Observation(self.client, self.capture, attrs)
+        root = Observation(self.client, self.capture, attrs, self)
         root.set_trace(metadata=trace_metadata, tags=tags)
         return root._child(name, as_type, input, metadata, model)
+
+    def score(self, trace_id, name, value, comment=None, timestamp=None):
+        """트레이스에 BOOLEAN 점수(1 또는 0)를 붙인다. 보냈으면 True.
+
+        키가 없거나 trace_id 가 없으면(계측 전에 만든 메시지 등) 보내지 않고 False 를 돌려준다.
+        score_id 를 '<트레이스 ID>-<점수 이름>' 으로 고정하고 timestamp 를 같게 보내면, 같은 점수를 다시 보낼 때
+        새로 쌓이지 않고 덮어쓴다(예: 좋아요를 별로예요로 바꿀 때).
+        comment 는 사용자가 쓴 글이라 원문 설정(capture)이 켜져 있을 때만, 가려서 보낸다.
+        """
+        if self.client is None or not trace_id:
+            return False
+        options = {"name": name, "value": float(value), "trace_id": trace_id, "data_type": "BOOLEAN",
+                   "score_id": f"{trace_id}-{name}"}
+        if timestamp is not None:
+            options["timestamp"] = timestamp
+        if comment and self.capture:
+            options["comment"] = redact(comment)[:500]
+        try:
+            self.client.create_score(**options)
+        except Exception as error:
+            log("WARNING", "Langfuse 점수 보내기 실패", score=name, error=type(error).__name__)
+            return False
+        self.flush()
+        return True
 
     def flush(self):
         """Cloud Run 은 응답을 닫은 뒤 CPU 를 거의 주지 않으므로, 응답을 닫기 전에 보낸다."""
@@ -202,4 +262,5 @@ def make_tracer(settings, **client_options):
         options["base_url"] = settings.langfuse_base_url
     client = Langfuse(**options, **client_options)
     return Tracer(client, settings.langfuse_capture_content,
-                  version=getattr(settings, "revision", None) or "local", commit=settings.commit)
+                  version=getattr(settings, "revision", None) or "local", commit=settings.commit,
+                  prompt_label="production" if settings.env == "production" else "staging")
