@@ -15,6 +15,7 @@
 Langfuse 는 트레이스 속성이 어느 span 에 있든 트레이스 전체의 속성으로 다루고, 태그는 모든 span 의 것을 합친다.
 값이 다르게 붙으면 어느 쪽을 쓸지 문서에 없으므로, 모르는 동안에는 임시값을 붙이지 않는다.
 """
+import hashlib
 import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -62,6 +63,16 @@ def now():
     return datetime.now(timezone.utc)
 
 
+def ab_variant(user_id):
+    """A/B 테스트 그룹. 사용자 ID 를 해시해 0~99 로 바꾸고, 50 미만이면 a, 아니면 b.
+
+    요청마다 무작위로 고르지 않아서 같은 사용자는 늘 같은 그룹이다. 파이썬 hash() 는 프로세스마다 값이 달라
+    인스턴스가 바뀌면 그룹이 바뀌므로, 어디서 돌려도 같은 SHA-256 을 쓴다.
+    """
+    bucket = int.from_bytes(hashlib.sha256(str(user_id).encode("utf-8")).digest()[:8], "big") % 100
+    return "a" if bucket < 50 else "b"
+
+
 class Observation:
     """Langfuse 관찰 객체 하나를 감싼다. raw 가 None 이면 아무것도 하지 않는다.
 
@@ -75,8 +86,17 @@ class Observation:
         self.tracer = tracer
 
     def get_prompt(self, name, fallback=None):
-        """Langfuse 프롬프트 관리에서 프롬프트를 가져온다. 못 가져오면 None(코드 문장을 쓴다)."""
-        return self.tracer.get_prompt(name, fallback) if self.tracer else None
+        """Langfuse 프롬프트 관리에서 프롬프트를 가져온다. 못 가져오면 None(코드 문장을 쓴다).
+
+        A/B 테스트가 켜져 있으면 트레이스의 user_id 로 그룹을 정하고, 트레이스 metadata 에 ab_variant 를 남긴다.
+        이 뒤에 만드는 span(choose-tools 등)부터 붙는다.
+        """
+        if not self.tracer:
+            return None
+        variant = self.tracer.variant_for(self.attrs.get("user_id"))
+        if variant:
+            self.set_trace(metadata={"ab_variant": variant})
+        return self.tracer.get_prompt(name, fallback, variant=variant)
 
     @property
     def trace_id(self):
@@ -163,34 +183,60 @@ NOOP = Observation()
 
 
 class Tracer:
-    def __init__(self, client=None, capture=False, version="local", commit="local", prompt_label="staging"):
+    def __init__(self, client=None, capture=False, version="local", commit="local", prompt_label="staging",
+                 ab_test=False):
         self.client = client
         self.capture = capture
         self.version = version  # Cloud Run 이 넣어 주는 K_REVISION. 없으면 local
         self.commit = commit    # COMMIT_SHA
         self.prompt_label = prompt_label  # ENV 가 production 이면 production, 그 밖에는 staging
+        self.ab_test = ab_test  # AB_TEST=on 일 때만 True
         self._prompt_warned = set()
 
-    def get_prompt(self, name, fallback=None):
-        """프롬프트 관리에서 prompt_label 의 버전을 가져온다. SDK 가 캐시하므로 매번 서버에 묻지 않는다.
+    def variant_for(self, user_id):
+        """A/B 테스트가 켜져 있고 사용자 ID 가 있으면 'a' 또는 'b', 아니면 None."""
+        return ab_variant(user_id) if self.ab_test and user_id else None
 
-        키가 없거나, 가져오지 못해 SDK 가 fallback 문장을 돌려주면 None 을 돌려준다.
-        그러면 부른 쪽이 코드에 남겨 둔 같은 문장을 쓰고, 그 generation 에는 프롬프트를 연결하지 않는다.
+    def _warn_once(self, key, message, **fields):
+        if key not in self._prompt_warned:  # 같은 경고가 턴마다 쌓이지 않게 한 번만 남긴다
+            self._prompt_warned.add(key)
+            log("WARNING", message, **fields)
+
+    def _fetch(self, name, label, fallback):
+        """label 의 버전을 가져온다. (프롬프트 또는 None, 못 가져온 이유)"""
+        try:
+            prompt = self.client.get_prompt(name, label=label, type="text", fallback=fallback)
+        except Exception as error:
+            return None, type(error).__name__
+        if getattr(prompt, "is_fallback", False):
+            return None, "fallback"
+        return prompt, None
+
+    def get_prompt(self, name, fallback=None, variant=None):
+        """프롬프트 관리에서 프롬프트를 가져온다. SDK 가 캐시하므로 매번 서버에 묻지 않는다.
+
+        - variant 가 없으면(A/B 꺼짐) prompt_label(production 또는 staging) 버전.
+        - variant 가 있으면 prod-a 또는 prod-b. 못 가져오면 production 라벨 버전.
+        키가 없거나 모두 못 가져오면 None 을 돌려준다. 그러면 부른 쪽이 코드에 남겨 둔 같은 문장을 쓰고,
+        그 generation 에는 프롬프트를 연결하지 않는다.
         """
         if self.client is None:
             return None
-        try:
-            prompt = self.client.get_prompt(name, label=self.prompt_label, type="text", fallback=fallback)
-        except Exception as error:
-            prompt, reason = None, type(error).__name__
+        if variant:
+            label = f"prod-{variant}"
+            prompt, reason = self._fetch(name, label, fallback)
+            if prompt is not None:
+                return prompt
+            self._warn_once((name, label), "A/B 라벨 프롬프트를 가져오지 못해 production 라벨을 씁니다",
+                            prompt=name, label=label, reason=reason)
+            label = "production"
         else:
-            reason = "fallback" if getattr(prompt, "is_fallback", False) else None
-        if reason is None:
+            label = self.prompt_label
+        prompt, reason = self._fetch(name, label, fallback)
+        if prompt is not None:
             return prompt
-        if name not in self._prompt_warned:  # 같은 경고가 턴마다 쌓이지 않게 한 번만 남긴다
-            self._prompt_warned.add(name)
-            log("WARNING", "Langfuse 프롬프트를 가져오지 못해 코드 문장을 씁니다", prompt=name,
-                label=self.prompt_label, reason=reason)
+        self._warn_once((name, label), "Langfuse 프롬프트를 가져오지 못해 코드 문장을 씁니다",
+                        prompt=name, label=label, reason=reason)
         return None
 
     @property
@@ -263,4 +309,5 @@ def make_tracer(settings, **client_options):
     client = Langfuse(**options, **client_options)
     return Tracer(client, settings.langfuse_capture_content,
                   version=getattr(settings, "revision", None) or "local", commit=settings.commit,
-                  prompt_label="production" if settings.env == "production" else "staging")
+                  prompt_label="production" if settings.env == "production" else "staging",
+                  ab_test=getattr(settings, "ab_test", False))
