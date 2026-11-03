@@ -2,7 +2,7 @@
 
 | 파일 | 데이터셋 | input | expected_output |
 | --- | --- | --- | --- |
-| tool_selection.jsonl | tool-selection | message | tools, args, optional_tools (+ next_holiday) |
+| tool_selection.jsonl | tool-selection | message, history | tools, args, optional_tools (+ next_holiday) |
 | memory_extraction.jsonl | memory-extraction | conversation | must_include, must_not_include |
 | safety.jsonl | safety | message | expected |
 | holiday_reply.jsonl | holiday-reply | message, tool_result | must_include, must_include_any, must_not_include, criteria |
@@ -59,7 +59,9 @@ def tool_selection_items(today):
                     "optional_tools": row.get("optional_tools") or []}
         if "다음 공휴일" in row["message"]:
             expected["next_holiday"] = next_holiday(today)
-        items.append((row["id"], {"message": row["message"]}, expected, row.get("category")))
+        # history 는 '그럼 모레는?' 같은 이어지는 질문을 판단하는 데 필요하다
+        items.append((row["id"], {"message": row["message"], "history": row.get("history") or []}, expected,
+                      row.get("category")))
     return items
 
 
